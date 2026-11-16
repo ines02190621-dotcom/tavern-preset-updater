@@ -8,6 +8,8 @@ import { createUpdaterCore } from '../src/core.mjs';
 const c = createUpdaterCore();
 const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url))).version;
 const script = JSON.parse(fs.readFileSync(new URL('../dist/酒馆预设智能更新器-v' + version + '.json', import.meta.url)));
+const nativeEntry = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+const manifest = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.meta.url)));
 const old = { temperature: 1, prompts: [{ identifier: 'a', name: '作者条目', content: '旧正文', role: 'system' }, { identifier: 'b', name: '作者规则', content: '规则', role: 'system' }],
   prompt_order: [{ character_id: 100001, order: [{ identifier: 'a', enabled: true }, { identifier: 'b', enabled: true }] }], extensions: {} };
 const local = c.copy(old); local.prompts.push({ identifier: 'x', name: '我的条目', content: '<img src=x onerror="parent.injected=true">', extra: { data: false } }); local.prompt_order[0].order.splice(1, 0, { identifier: 'x', enabled: false, unknown: 'retain' });
@@ -49,9 +51,12 @@ async function harness(strings = true, noDatabase = false, options = {}) {
   const manager = { getSelectedPresetName: () => '我的预设', getSelectedPreset: () => '0', getPresetList: () => ({ presets: [state.saved], preset_names: { 我的预设: 0 }, settings: state.live }),
     async savePreset(name, raw, options) { assert.equal(name, '我的预设'); assert.equal(options.skipUpdate, true); state.writes.push(c.copy(raw)); state.disk = c.copy(raw); },
     updateList(name, raw) { state.saved = c.copy(raw); state.live = c.copy(raw); } };
-  const ctx = { mainApi: 'openai', getPresetManager: () => manager, getRequestHeaders: () => ({ 'Content-Type': 'application/json' }) };
+  const ctx = { mainApi: 'openai', getPresetManager: () => manager, getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+    extensionSettings: options.extensionSettings || { variables: { global: state.vars } },
+    async saveSettingsDebounced() { state.settingSaves = (state.settingSaves || 0) + 1; } };
+  state.ctx = ctx;
   host.SillyTavern = { getContext: () => ctx };
-  host.fetch = async function() { assert.equal(this, host); state.diskReads++; return { ok: true, json: async () => ({ openai_setting_names: ['我的预设'], openai_settings: [strings ? JSON.stringify(state.disk) : c.copy(state.disk)] }) }; };
+  host.fetch = async function() { assert.ok(this?.document === host.document, 'fetch must use the main-window receiver'); state.diskReads++; return { ok: true, json: async () => ({ openai_setting_names: ['我的预设'], openai_settings: [strings ? JSON.stringify(state.disk) : c.copy(state.disk)] }) }; };
   const api = { getChatCompletionPreset: () => c.copy(state.live), getPresetApplicationPromise: async () => {} };
   const OriginalFunction = host.Function;
   let releaseModule;
@@ -71,14 +76,24 @@ async function harness(strings = true, noDatabase = false, options = {}) {
   if (options.staleSingleton) host.__presetSmartUpdaterV1 = { close() { state.closedStale = true; } };
   const frame = host.document.createElement('iframe'); frame.srcdoc = ''; host.document.body.append(frame); await until(() => frame.contentWindow, 'iframe'); const child = frame.contentWindow;
   child.getVariables = () => c.copy(state.vars); child.insertOrAssignVariables = v => Object.assign(state.vars, v); child.getButtonEvent = x => x; child.eventOn = (key, cb) => { state.events[key] = cb; };
-  child.eval(script.content);
-  await until(() => state.events['预设更新器'], 'script button registration');
-  if (!options.deferOpen) await state.events['预设更新器']();
+  if (options.native) {
+    const mountPanel = () => { const target = host.document.createElement('div'); target.id = 'extensions_settings'; host.document.body.append(target); };
+    if (options.delayPanel) host.setTimeout(mountPanel, 10); else mountPanel();
+    host.eval(nativeEntry); await until(() => host.document.querySelector('#preset-smart-updater-native-controls button'), 'native extension button');
+    if (!options.deferOpen) {
+      host.document.querySelector('#preset-smart-updater-native-controls button').click();
+      await until(() => host.document.querySelector('[data-preset-updater-surface]')?.shadowRoot?.querySelector('.busy-mask')?.hidden, 'native initialization');
+    }
+  } else {
+    child.eval(script.content);
+    await until(() => state.events['预设更新器'], 'script button registration');
+    if (!options.deferOpen) await state.events['预设更新器']();
+  }
   return { host, child, state, releaseModule, get root() { return host.document.querySelector('[data-preset-updater-surface]')?.shadowRoot; },
-    async dispose() { child.dispatchEvent(new child.Event('unload')); await host.happyDOM.close(); } };
+    async dispose() { child.dispatchEvent(new child.Event('unload')); host.__presetSmartUpdaterV1?.dispose?.(); await host.happyDOM.close(); } };
 }
-for (const strings of [true, false]) test('full DOM workflow with IndexedDB transactions: ' + (strings ? 'native ST/TT string-array response' : 'object-array compatibility response'), async () => {
-  const h = await harness(strings); const { root, state } = h;
+for (const strings of [true, false]) for (const nativeMode of [false, true]) test('full DOM workflow with IndexedDB transactions: ' + (nativeMode ? 'URL extension / ' : 'JSON script / ') + (strings ? 'native ST/TT string-array response' : 'object-array compatibility response'), async () => {
+  const h = await harness(strings, false, { native: nativeMode }); const { root, state } = h;
   try {
     assert.equal(state.moduleImports, 1); assert.equal(state.writes.length, 0);
     findButton(root, '去首次绑定').click(); await until(() => root.textContent.includes('选择作者旧版 JSON'));
@@ -107,6 +122,73 @@ for (const strings of [true, false]) test('full DOM workflow with IndexedDB tran
     await until(() => state.writes.length === 3 && root.querySelector('.busy-mask').hidden, 'undo restore'); assert.equal(state.disk.prompts[0].content, '新正文');
     assert.ok(state.diskReads > 0); assert.deepEqual(state.errors, []);
     assert.ok(h.host.document.querySelector('dialog > [data-preset-updater-surface]').shadowRoot === root);
+  } finally { await h.dispose(); }
+});
+test('installable manifest resolves to the generated native entry and declares no helper dependency', () => {
+  assert.equal(manifest.version, version); assert.equal(manifest.js, 'index.js'); assert.deepEqual(manifest.requires, []); assert.equal(manifest.auto_update, false);
+  assert.ok(!nativeEntry.includes("import { startUpdater }")); assert.ok(nativeEntry.includes('startNativeUpdater().catch'));
+});
+test('native extension registers one button and does no module, database or settings work until opened', async () => {
+  const h = await harness(true, false, { native: true, deferOpen: true, extensionSettings: {} });
+  try {
+    assert.equal(typeof h.host.getVariables, 'undefined'); assert.equal(typeof h.host.eventOn, 'undefined');
+    assert.equal(h.state.moduleImports, 0); assert.equal(h.state.settingSaves || 0, 0); assert.equal(h.root, undefined);
+    h.host.eval(nativeEntry); await until(() => h.host.document.querySelector('#preset-smart-updater-native-controls button'));
+    assert.equal(h.host.document.querySelectorAll('#preset-smart-updater-native-controls').length, 1);
+    h.host.document.querySelector('#preset-smart-updater-native-controls button').click();
+    await until(() => h.root?.querySelector('.busy-mask')?.hidden); assert.equal(h.state.moduleImports, 1); assert.equal(h.state.settingSaves, 1);
+    assert.ok(h.state.ctx.extensionSettings.preset_smart_updater.scope); assert.deepEqual(h.state.errors, []);
+  } finally { await h.dispose(); }
+});
+test('native extension reuses a script binding and its backups after the helper script is disabled', async () => {
+  const h = await harness();
+  try {
+    let root = h.root;
+    findButton(root, '去首次绑定').click(); await until(() => root.textContent.includes('选择作者旧版 JSON'));
+    await selectFile(root, old); checkLabel(root, '我确认这份作者旧版'); findButton(root, '保存首次绑定').click(); await until(() => root.textContent.includes('绑定好了'));
+    const oldScope = h.state.vars.__preset_smart_updater_scope_v1;
+    h.child.dispatchEvent(new h.child.Event('unload')); assert.equal(h.host.__presetSmartUpdaterV1, undefined);
+    const target = h.host.document.createElement('div'); target.id = 'extensions_settings'; h.host.document.body.append(target);
+    h.host.eval(nativeEntry); await until(() => h.host.document.querySelector('#preset-smart-updater-native-controls button'));
+    h.host.document.querySelector('#preset-smart-updater-native-controls button').click(); await until(() => h.root?.querySelector('.busy-mask')?.hidden);
+    root = h.root; assert.equal(h.state.ctx.extensionSettings.preset_smart_updater.scope, oldScope);
+    assert.ok(root.textContent.includes('选择作者新版 JSON')); assert.equal(h.state.writes.length, 0);
+    findButton(root, '备份恢复').click(); await until(() => root.querySelector('.backup')); assert.ok(root.textContent.includes('首次绑定'));
+  } finally { await h.dispose(); }
+});
+test('native mode takes ownership from the JSON mode and survives subsequent helper-script unloads', async () => {
+  const h = await harness(true, false, { deferOpen: true });
+  try {
+    assert.equal(h.host.__presetSmartUpdaterV1.mode, 'script');
+    const target = h.host.document.createElement('div'); target.id = 'extensions_settings'; h.host.document.body.append(target);
+    h.host.eval(nativeEntry); await until(() => h.host.__presetSmartUpdaterV1.mode === 'extension');
+    const instance = h.host.__presetSmartUpdaterV1;
+    h.child.eval(script.content); assert.equal(h.host.__presetSmartUpdaterV1, instance);
+    h.child.dispatchEvent(new h.child.Event('unload')); assert.equal(h.host.__presetSmartUpdaterV1, instance);
+    h.host.document.querySelector('#preset-smart-updater-native-controls button').click(); await until(() => h.root?.querySelector('.busy-mask')?.hidden);
+    assert.deepEqual(h.state.errors, []);
+  } finally { await h.dispose(); }
+});
+test('native storage failures leave the extension usable and prohibit in-place updates', async () => {
+  const h = await harness(true, true, { native: true, extensionSettings: {} });
+  try { assert.ok(h.root.textContent.includes('备份数据库不可用')); assert.equal(h.state.writes.length, 0); assert.ok(h.root.textContent.includes('离线')); }
+  finally { await h.dispose(); }
+});
+test('native entry waits for a late-loading extension panel and still mounts just one launcher', async () => {
+  const h = await harness(true, false, { native: true, deferOpen: true, delayPanel: true, extensionSettings: {} });
+  try { assert.equal(h.host.document.querySelectorAll('#preset-smart-updater-native-controls').length, 1); assert.equal(h.state.moduleImports, 0); }
+  finally { await h.dispose(); }
+});
+test('changing user namespace after preview prevents a native write into another account', async () => {
+  const h = await harness(true, false, { native: true, extensionSettings: {} });
+  try {
+    const root = h.root;
+    findButton(root, '去首次绑定').click(); await until(() => root.textContent.includes('选择作者旧版 JSON'));
+    await selectFile(root, old); checkLabel(root, '我确认这份作者旧版'); findButton(root, '保存首次绑定').click(); await until(() => root.textContent.includes('绑定好了'));
+    await selectFile(root, remote); findButton(root, '生成三方合并预览').click(); await until(() => root.querySelector('.plan'));
+    h.state.ctx.extensionSettings = { preset_smart_updater: { scope: 'different-user-123456789' } };
+    checkLabel(root, '我已核对作者的新增'); findButton(root, '备份并原位更新').click(); await until(() => root.querySelector('.confirm-card')); findButton(root, '确认备份并更新').click();
+    await until(() => root.querySelector('.note').textContent.includes('数据空间发生变化')); assert.equal(h.state.writes.length, 0);
   } finally { await h.dispose(); }
 });
 test('UI requires a field conflict decision and uses the chosen author text', async () => {
