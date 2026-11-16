@@ -1,0 +1,15 @@
+{
+  "name": "preset-smart-updater",
+  "private": true,
+  "version": "1.0.3",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test test/*.test.mjs",
+    "test:browser": "node build.mjs && node test/browser.mjs"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.8",
+    "happy-dom": "^21.0.4"
+  }
+}
