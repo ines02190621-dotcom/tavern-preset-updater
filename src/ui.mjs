@@ -1,18 +1,32 @@
-export async function startUpdater() {
+import { createUpdaterCore } from './core.mjs';
+import { createHostAdapter } from './adapter.mjs';
+import { createUpdaterStore } from './storage.mjs';
+import { resolveUpdaterScope } from './scope.mjs';
+
+export async function startUpdater(runtime = {}) {
   const core = createUpdaterCore();
-  let host = window.parent;
+  let host = runtime.host || window.parent;
   try { void host.document.body; } catch { host = window; }
   const SINGLETON = '__presetSmartUpdaterV1';
-  const VERSION = '1.0.3';
-  if (host[SINGLETON]?.version === VERSION) {
-    eventOn(getButtonEvent('预设更新器'), host[SINGLETON].open);
-    return;
+  const VERSION = '1.1.0', mode = runtime.mode || 'script';
+  const registerButton = open => {
+    if (typeof runtime.registerButton === 'function') return runtime.registerButton(open);
+    if (typeof eventOn === 'function' && typeof getButtonEvent === 'function') { eventOn(getButtonEvent('预设更新器'), open); return () => {}; }
+    throw Error('酒馆助手脚本按钮接口不可用，请使用扩展版或更新酒馆助手。');
+  };
+  if (host[SINGLETON]?.version === VERSION && !(mode === 'extension' && host[SINGLETON].mode !== 'extension')) {
+    registerButton(host[SINGLETON].open);
+    return host[SINGLETON];
   }
+  if (host[SINGLETON]?.busy) throw Error('预设更新器正在处理任务，请等完成后再切换脚本版或扩展版。');
   // A failed v1.0.0 open could leave a detached dialog referenced by its singleton.
   try { host[SINGLETON]?.dispose?.(); host[SINGLETON]?.close?.(); } catch { /* Replace the stale UI instance below. */ }
   const doc = host.document;
   const context = () => host.SillyTavern?.getContext?.() || (typeof SillyTavern !== 'undefined' ? SillyTavern : null);
-  let openai, adapter, store, initialization, interfaceError = '', storageError = '';
+  let openai, adapter, store, initialization, initializedScope, detachButton, interfaceError = '', storageError = '';
+  const resolveScope = () => resolveUpdaterScope({ core, context: context(), mode,
+    readLegacy: mode === 'script' && typeof getVariables === 'function' ? () => getVariables({ type: 'global' }) : undefined,
+    writeLegacy: mode === 'script' && typeof insertOrAssignVariables === 'function' ? value => insertOrAssignVariables(value, { type: 'global' }) : undefined });
   const memory = new Map();
   const memoryStore = () => ({ getBinding: async n => memory.get(n), putBinding: async b => memory.set(b.name, core.copy(b)), backups: async () => [] });
   function bounded(promise, ms, message, disposeLate) {
@@ -37,14 +51,14 @@ export async function startUpdater() {
       } catch (e) { interfaceError = '没有载入酒馆本地的预设模块：' + (e?.message || e); }
       adapter = createHostAdapter({ host, context, openai, core });
       try {
-        if (typeof getVariables !== 'function' || typeof insertOrAssignVariables !== 'function') throw Error('酒馆助手缺少全局变量接口。');
-        const key = '__preset_smart_updater_scope_v1';
-        let scope = getVariables({ type: 'global' })[key];
-        if (typeof scope !== 'string' || !/^[a-zA-Z0-9-]{10,80}$/.test(scope)) {
-          scope = core.uuid(host.crypto);
-          insertOrAssignVariables({ [key]: scope }, { type: 'global' });
-        }
+        const scope = await resolveScope(); initializedScope = scope;
         store = await bounded(createUpdaterStore({ host, scope, core }), 8000, '备份数据库打开超时，原位写入已停用', value => value.close());
+        // A host-side account/settings switch must never reuse another user's database.
+        const withLock = store.withLock;
+        store.withLock = action => withLock(async () => {
+          if (await resolveScope() !== initializedScope) throw Error('当前用户的数据空间发生变化，请刷新酒馆后重新打开更新器。');
+          return action();
+        });
       } catch (e) { storageError = e?.message || String(e); }
       // A failed database never falls back to an unprotected preset write.
       if (!store) store = memoryStore();
@@ -209,6 +223,7 @@ export async function startUpdater() {
     core.checkMap(base, side, map); return core.copy(map);
   }
   async function refreshCurrent() {
+    if (initializedScope && !storageError && await resolveScope() !== initializedScope) throw Error('当前用户的数据空间发生变化，请刷新酒馆后重新打开更新器。');
     const previous = state.snapshot;
     if (state.offline) { if (!state.snapshot) throw Error('请先选择你当前修改版的 JSON。'); }
     else {
@@ -469,7 +484,7 @@ export async function startUpdater() {
       ['开关与参数', '默认保留现有条目的启用开关。其他字段按三方对比合并；双方修改同一字段时必须选择。连接、模型和地址保持当前设置。'],
       ['正则与脚本', '扩展数据默认保留当前。可逐项确认采用作者整项扩展；这会替换该扩展项，包括它自己的自定义内容。脚本不会在对比阶段执行，采用扩展并加载预设后会按酒馆规则运行。'],
       ['备份与撤销', '每次写入前先提交完整备份，写入后从后端读取校验。恢复也会先备份现状，因此可以再恢复回来。数据库失败或未完成记录尚未核对时，停止原位更新。'],
-      ['兼容边界', '支持含 prompts / prompt_order 的原始 Chat Completion 预设。需要酒馆助手脚本库和两边共有的预设管理接口。Text Completion、世界书和角色卡不在此版范围。缺少可靠接口时只能离线对比导出。'],
+      ['兼容边界', '支持含 prompts / prompt_order 的原始 Chat Completion 预设。扩展版可独立运行，JSON 脚本版使用酒馆助手脚本库；两者均检查实际预设接口。Text Completion、世界书和角色卡不在此版范围。缺少可靠接口时只能离线对比导出。'],
       ['同时编辑', '更新器窗口之间有互斥锁，且保存前检查当前选择、未保存设置和磁盘内容。酒馆保存接口没有原子版本锁；请勿在保存过程中从另一台设备、原生编辑器或同步程序修改同一预设。'],
       ['未保存编辑', '当前界面已经提交到设置中的改动会纳入合并和备份。条目编辑弹窗中还没按“保存”的文字无法读取；请先保存编辑弹窗，再打开更新器。'],
       ['改名与换设备', '绑定按酒馆现有预设名称保存。手动给预设改名后需重新绑定。换设备或清除应用数据前导出完整恢复包；离线导出的合并文件不会自动推进原位更新的作者基准。'],
@@ -545,12 +560,13 @@ export async function startUpdater() {
     }
   }
   let disposed = false;
-  const cleanup = () => { if (disposed) return; disposed = true; if (dialog) dialog.remove(); store?.close?.(); if (host[SINGLETON]?.open === safeOpen) delete host[SINGLETON]; };
-  host[SINGLETON] = { version: VERSION, open: safeOpen, close, dispose: cleanup };
+  const cleanup = () => { if (disposed) return; disposed = true; if (dialog) dialog.remove(); detachButton?.(); store?.close?.(); if (host[SINGLETON]?.open === safeOpen) delete host[SINGLETON]; };
+  const instance = { version: VERSION, mode, open: safeOpen, close, dispose: cleanup, get busy() { return state.busy; } };
+  host[SINGLETON] = instance;
   window.addEventListener('pagehide', cleanup, { once: true });
   window.addEventListener('unload', cleanup, { once: true });
   // Register immediately: slow imports or WKWebView IndexedDB must not swallow clicks.
-  if (typeof eventOn === 'function' && typeof getButtonEvent === 'function') eventOn(getButtonEvent('预设更新器'), safeOpen);
-  else throw Error('酒馆助手脚本按钮接口不可用，请更新酒馆助手。');
+  detachButton = registerButton(safeOpen);
   // Run only when requested: enabling the global script does not pop up a window or write presets.
+  return instance;
 }
